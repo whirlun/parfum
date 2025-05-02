@@ -1,18 +1,11 @@
 .global _switch
+.global _recover
 
 _switch:
     mov x9, sp
     str x9, [x0, #0]
 
-    stp x2, x3, [x0, #0x20]
-    stp x4, x5, [x0, #0x30]
-    stp x6, x7, [x0, #0x40]
-    stp x8, x9, [x0, #0x50]
-    stp x10, x11, [x0, #0x60]
-    stp x12, x13, [x0, #0x70]
-    stp x14, x15, [x0, #0x80]
-    stp x16, x17, [x0, #0x90]
-    stp x18, x19, [x0, #0xa0]
+    str x19, [x0, #0xa8]
     stp x20, x21, [x0, #0xb0]
     stp x22, x23, [x0, #0xc0]
     stp x24, x25, [x0, #0xd0]
@@ -44,15 +37,7 @@ _switch:
     ldr x9, [x1, #0]
     mov sp, x9
 
-    ldp x2, x3, [x1, #0x20]
-    ldp x4, x5, [x1, #0x30]
-    ldp x6, x7, [x1, #0x40]
-    ldp x8, x9, [x1, #0x50]
-    ldp x10, x11, [x1, #0x60]
-    ldp x12, x13, [x1, #0x70]
-    ldp x14, x15, [x1, #0x80]
-    ldp x16, x17, [x1, #0x90]
-    ldp x18, x19, [x1, #0xa0]
+    ldr x19, [x1, #0xa8]
     ldp x20, x21, [x1, #0xb0]
     ldp x22, x23, [x1, #0xc0]
     ldp x24, x25, [x1, #0xd0]
@@ -78,5 +63,5 @@ _switch:
 
     //ldr lr, [x1, #0x310]
 
-    ldr x0, [x1, #0x310]
-    br x0
+    ldr x16, [x1, #0x310]
+    br x16
