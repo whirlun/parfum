@@ -1,0 +1,7 @@
+[package]
+name = "parfum-example"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+parfum = {path = "../parfum"}
