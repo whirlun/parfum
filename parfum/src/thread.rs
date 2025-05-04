@@ -1,21 +1,18 @@
-use core::arch::{global_asm, asm, naked_asm};
+use core::arch::{global_asm, asm};
 use std::cell::{RefCell, UnsafeCell};
 use std::include_str;
 use std::sync::atomic::{AtomicI32, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use crate::scheduler;
 use libc::__darwin_arm_thread_state64 as DarwinArmThreadState;
 use libc::__darwin_arm_neon_state64 as DarwinArmNeonState;
-use lazy_static::lazy_static;
-use crossbeam::deque::{Injector, Steal, Stealer, Worker};
+use crossbeam::deque::{Injector, Worker};
 use once_cell::sync::Lazy;
 use std::thread;
-static mut CTX_SCHEDULER: ThreadContext = ThreadContext::zeroed();
-static mut SCHEDULER: *mut Scheduler = std::ptr::null_mut();
+
+use crate::stack::reserve_stack;
 static COOP_INJECTOR: Lazy<Injector<Arc<GreenThread>>> = Lazy::new(Injector::new);
 static PREEPMT_INJECTOR: Lazy<Injector<Arc<GreenThread>>> = Lazy::new(Injector::new);
-static COOP_STEALERS: Lazy<Mutex<Vec<Stealer<Arc<GreenThread>>>>> = Lazy::new(Default::default);
-static PREEMT_STEALERS: Lazy<Mutex<Vec<Stealer<Arc<GreenThread>>>>> = Lazy::new(Default::default);
+pub static THREADS: Mutex<Vec<Arc<GreenThread>>> = Mutex::new(Vec::new());
 thread_local! {
     static COOP_WORKER: Worker<Arc<GreenThread>> = Worker::new_fifo();
     static PREEPMT_WORKER: Worker<Arc<GreenThread>> = Worker::new_fifo();
@@ -23,7 +20,8 @@ thread_local! {
 }
 pub struct GreenThread {
     pub context: UnsafeCell<ThreadContext>,
-    pub stack: Vec<u8>,
+    pub stack_top: usize,
+    pub stack_bottom: AtomicUsize,
     pub tid: usize,
     pub state: AtomicUsize,
     pub ticks: AtomicI32,
@@ -70,32 +68,22 @@ pub enum ThreadState {
 
 
 pub struct Scheduler {
-    pub threads: Vec<Arc<GreenThread>>,
-    pub current_thread: AtomicUsize,
 }
 
 impl Scheduler {
     pub fn new() -> Self {
-        Self {
-            threads: Vec::new(),
-            current_thread: AtomicUsize::new(0),
-        }
-    }
-
-    fn mark_thread_state(&self, tid: usize, state: ThreadState) {
-        if let Some(thread) = self.threads.get(tid) {
-            thread.state.store(state as usize, Ordering::SeqCst);
-        }
+        Self {}
     }
 
     pub fn spawn(&mut self, entry: unsafe extern "C" fn()) {
         let mut ctx = ThreadContext::zeroed();
-        let mut stack = vec![0u8; 4096];
-        init_stack(&mut stack, &mut ctx, true, entry);
-        let tid = self.threads.len();
+        let (top, bottom) = unsafe { reserve_stack()} ;
+        init_stack(top, &mut ctx, true, entry);
+        let tid = THREADS.lock().unwrap().len();
         let thread = Arc::new(GreenThread {
             context: UnsafeCell::new(ctx),
-            stack,
+            stack_top: top,
+            stack_bottom: AtomicUsize::new(bottom),
             tid,
             state: AtomicUsize::new(ThreadState::READY as usize),
             ticks: AtomicI32::new(100),
@@ -103,18 +91,19 @@ impl Scheduler {
             next: AtomicPtr::new(std::ptr::null_mut()),
         });
         println!("Spawning thread {}", tid);
-        self.threads.push(thread.clone());
+        THREADS.lock().unwrap().push(thread.clone());
         PREEPMT_INJECTOR.push(thread);
     }
 
     pub fn spawn_yield(&mut self, entry: unsafe extern "C" fn()) {
         let mut ctx = ThreadContext::zeroed();
-        let mut stack = vec![0u8; 4096];
-        init_stack(&mut stack, &mut ctx, false, entry);
-        let tid = self.threads.len();
+        let (top, bottom) = unsafe { reserve_stack() };
+        init_stack(top, &mut ctx, false, entry);
+        let tid = THREADS.lock().unwrap().len();
         let thread = Arc::new(GreenThread {
             context: UnsafeCell::new(ctx),
-            stack,
+            stack_top: top,
+            stack_bottom: AtomicUsize::new(bottom),
             tid,
             state: AtomicUsize::new(ThreadState::READY as usize),
             ticks: AtomicI32::new(100),
@@ -122,27 +111,22 @@ impl Scheduler {
             next: AtomicPtr::new(std::ptr::null_mut()),
         });
         println!("Spawning thread {}", tid);
-        self.threads.push(thread.clone());
+        THREADS.lock().unwrap().push(thread.clone());
         COOP_INJECTOR.push(thread);
     }
 }
 
 
-pub fn init_stack(stack: &mut [u8], ctx: &mut ThreadContext, preempt: bool, entry: unsafe extern "C" fn()) {
-    let sp = (stack.as_mut_ptr() as usize + stack.len()) & !0x0F; // 16-byte align
-    assert!((sp as usize) >= stack.as_ptr() as usize);
-    unsafe {
-        // let stack_top = (sp - 32) as *mut usize;
-        // *stack_top = 0;
-        //*(stack_top.add(1)) = event_loop_entry as usize;
-        //*(stack_top.add(1)) = entry as usize;
+pub fn init_stack(stack_top: usize, ctx: &mut ThreadContext, preempt: bool, entry: unsafe extern "C" fn()) {
+    let sp = stack_top & !0x0F; // 16-byte align
+    assert!((sp as usize) >= stack_top);
 
-        ctx.sp = sp;
-        ctx.regs = [0; 32];
-        ctx.regs[30] = if preempt {preempt_end as usize} else {coop_end as usize};
-        ctx.fpregs = [0; 32];
-        ctx.pc = entry as usize;
-    }
+    ctx.sp = sp;
+    ctx.regs = [0; 32];
+    ctx.regs[30] = if preempt {preempt_end as usize} else {coop_end as usize};
+    ctx.fpregs = [0; 32];
+    ctx.pc = entry as usize;
+    
 }
 
 fn setup_timer() {
@@ -150,11 +134,11 @@ fn setup_timer() {
         let timer = libc::itimerval {
             it_interval: libc::timeval {
                 tv_sec: 0,
-                tv_usec: 10000, // 10ms
+                tv_usec: 100000, // 10ms
             },
             it_value: libc::timeval {
                 tv_sec: 0,
-                tv_usec: 10000, // 10ms
+                tv_usec: 100000, // 10ms
             },
         };
         if libc::setitimer(libc::ITIMER_REAL, &timer, std::ptr::null_mut()) != 0 {
@@ -247,7 +231,8 @@ fn test(s: usize) {
 extern "C" fn hello() {
     test(1);
     //yield_to();
-    //std::thread::sleep(std::time::Duration::from_millis(2000));
+    std::thread::sleep(std::time::Duration::from_millis(2000));
+    //yield_to();
     println!("Hello, world!");
 }
 
@@ -300,6 +285,7 @@ pub fn start_thread_pool() {
                         libc::pthread_sigmask(libc::SIG_UNBLOCK, &mask, std::ptr::null_mut());
                         setup_preemption();
                     }
+                    std::thread::sleep(std::time::Duration::from_millis(1000));
                 }
             })
             .expect("Failed to spawn preemptive worker thread");
@@ -311,38 +297,8 @@ pub fn start_thread_pool() {
     coop_handle.join().expect("Failed to join cooperative worker thread");
 }
 
-pub fn run() {
-    unsafe {
-        SCHEDULER = Box::into_raw(Box::new(Scheduler::new()));
-        let scheduler = &mut *SCHEDULER;
-        //scheduler.spawn_yield(hello);
-        //scheduler.spawn_yield(world);
-        scheduler.spawn(world);
-        scheduler.spawn(hello);
-        // let first = scheduler.threads.first().unwrap();
-        // CURRENT.with(|c| {
-        //     *c.borrow_mut() = Some(Arc::from_raw(first));
-        // });
-        
-       setup_preemption();
-       loop{};
-    //    (*first).state.store(ThreadState::RUNNING as usize, Ordering::Release);
-    //     let mut dummy_ctx = ThreadContext::zeroed();
-    //     let ctx = first.context.get();
-    //     switch(&mut dummy_ctx, ctx);
-    //     core::hint::unreachable_unchecked();
-        //coop_end();
-    }
-
-}
-
 fn yield_to() {
     unsafe {
-        let next = COOP_WORKER.with(|local| {
-            local.pop().or_else(|| {
-                COOP_INJECTOR.steal().success()
-            })
-        });
         let cur = CURRENT.with(|c| c.borrow().clone());
         debug_assert!(!cur.is_none(), "yield_now with no CURRENT thread");
         let cur = cur.unwrap();
@@ -351,10 +307,11 @@ fn yield_to() {
         }
         cur.state.store(ThreadState::YIELD as usize, Ordering::Release);
         COOP_INJECTOR.push(cur.clone());
-        if next.is_none() {
-            println!("No more threads to run, exiting.");
-            thread_exit();
-        }
+        let next = COOP_WORKER.with(|local| {
+            local.pop().or_else(|| {
+                COOP_INJECTOR.steal().success()
+            })
+        });
         let next = next.unwrap();
         println!("Switching to thread {} cooperatively", (*next).tid);
         (*next).state.store(ThreadState::RUNNING as usize, Ordering::Release);
@@ -374,7 +331,9 @@ pub unsafe extern "C" fn preempt_end() {
             cur.state.store(ThreadState::EXITED as usize, Ordering::Release);
         }
     }
-    loop {}
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     
 }
 
@@ -392,6 +351,7 @@ pub unsafe extern "C" fn coop_end() {
             })
         });
         if next.is_none() {
+            std::thread::sleep(std::time::Duration::from_millis(1000));
             continue;
         }
         let next = next.unwrap();
