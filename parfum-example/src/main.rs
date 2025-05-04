@@ -3,6 +3,6 @@ use parfum::thread;
 
 fn main() {
     unsafe {
-        thread::run();
+        thread::start_thread_pool();
     }
 }

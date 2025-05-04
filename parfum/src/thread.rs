@@ -1,26 +1,38 @@
 use core::arch::{global_asm, asm, naked_asm};
+use std::cell::{RefCell, UnsafeCell};
 use std::include_str;
 use std::sync::atomic::{AtomicI32, AtomicPtr, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use crate::scheduler;
-use crate::msqueue::MsQueue;
 use libc::__darwin_arm_thread_state64 as DarwinArmThreadState;
 use libc::__darwin_arm_neon_state64 as DarwinArmNeonState;
 use lazy_static::lazy_static;
+use crossbeam::deque::{Injector, Steal, Stealer, Worker};
+use once_cell::sync::Lazy;
+use std::thread;
 static mut CTX_SCHEDULER: ThreadContext = ThreadContext::zeroed();
 static mut SCHEDULER: *mut Scheduler = std::ptr::null_mut();
-static mut CURRENT: AtomicPtr<GreenThread> = AtomicPtr::new(std::ptr::null_mut());
-lazy_static! {
-    static ref QUEUE: MsQueue = MsQueue::new();
+static COOP_INJECTOR: Lazy<Injector<Arc<GreenThread>>> = Lazy::new(Injector::new);
+static PREEPMT_INJECTOR: Lazy<Injector<Arc<GreenThread>>> = Lazy::new(Injector::new);
+static COOP_STEALERS: Lazy<Mutex<Vec<Stealer<Arc<GreenThread>>>>> = Lazy::new(Default::default);
+static PREEMT_STEALERS: Lazy<Mutex<Vec<Stealer<Arc<GreenThread>>>>> = Lazy::new(Default::default);
+thread_local! {
+    static COOP_WORKER: Worker<Arc<GreenThread>> = Worker::new_fifo();
+    static PREEPMT_WORKER: Worker<Arc<GreenThread>> = Worker::new_fifo();
+    static CURRENT: RefCell<Option<Arc<GreenThread>>> = RefCell::new(None);
 }
 pub struct GreenThread {
-    pub context: ThreadContext,
+    pub context: UnsafeCell<ThreadContext>,
     pub stack: Vec<u8>,
     pub tid: usize,
     pub state: AtomicUsize,
     pub ticks: AtomicI32,
+    pub preempt_active: bool,
     pub next: AtomicPtr<GreenThread>,
 }
 
+unsafe impl Send for GreenThread {}
+unsafe impl Sync for GreenThread {}
 
 #[repr(C)]
 #[derive(Default)]
@@ -58,7 +70,7 @@ pub enum ThreadState {
 
 
 pub struct Scheduler {
-    pub threads: Vec<GreenThread>,
+    pub threads: Vec<Arc<GreenThread>>,
     pub current_thread: AtomicUsize,
 }
 
@@ -76,38 +88,47 @@ impl Scheduler {
         }
     }
 
-    fn next_ready(&self) -> Option<(usize, &GreenThread)> {
-        self.threads
-        .iter()
-        .enumerate()
-        .cycle()
-        .skip(self.current_thread.load(Ordering::Acquire) + 1)
-        .take(self.threads.len())
-        .find(|(_, thread)| {
-            thread.state.load(Ordering::Acquire) == ThreadState::READY as usize
-        })
-    }
-
     pub fn spawn(&mut self, entry: unsafe extern "C" fn()) {
         let mut ctx = ThreadContext::zeroed();
         let mut stack = vec![0u8; 4096];
-        init_stack(&mut stack, &mut ctx, entry);
+        init_stack(&mut stack, &mut ctx, true, entry);
         let tid = self.threads.len();
-        let thread = GreenThread {
-            context: ctx,
+        let thread = Arc::new(GreenThread {
+            context: UnsafeCell::new(ctx),
             stack,
             tid,
             state: AtomicUsize::new(ThreadState::READY as usize),
             ticks: AtomicI32::new(100),
+            preempt_active: true,
             next: AtomicPtr::new(std::ptr::null_mut()),
-        };
+        });
         println!("Spawning thread {}", tid);
-        self.threads.push(thread);
+        self.threads.push(thread.clone());
+        PREEPMT_INJECTOR.push(thread);
+    }
+
+    pub fn spawn_yield(&mut self, entry: unsafe extern "C" fn()) {
+        let mut ctx = ThreadContext::zeroed();
+        let mut stack = vec![0u8; 4096];
+        init_stack(&mut stack, &mut ctx, false, entry);
+        let tid = self.threads.len();
+        let thread = Arc::new(GreenThread {
+            context: UnsafeCell::new(ctx),
+            stack,
+            tid,
+            state: AtomicUsize::new(ThreadState::READY as usize),
+            ticks: AtomicI32::new(100),
+            preempt_active: false,
+            next: AtomicPtr::new(std::ptr::null_mut()),
+        });
+        println!("Spawning thread {}", tid);
+        self.threads.push(thread.clone());
+        COOP_INJECTOR.push(thread);
     }
 }
 
 
-pub fn init_stack(stack: &mut [u8], ctx: &mut ThreadContext, entry: unsafe extern "C" fn()) {
+pub fn init_stack(stack: &mut [u8], ctx: &mut ThreadContext, preempt: bool, entry: unsafe extern "C" fn()) {
     let sp = (stack.as_mut_ptr() as usize + stack.len()) & !0x0F; // 16-byte align
     assert!((sp as usize) >= stack.as_ptr() as usize);
     unsafe {
@@ -118,7 +139,7 @@ pub fn init_stack(stack: &mut [u8], ctx: &mut ThreadContext, entry: unsafe exter
 
         ctx.sp = sp;
         ctx.regs = [0; 32];
-        ctx.regs[30] = event_loop_entry as usize;
+        ctx.regs[30] = if preempt {preempt_end as usize} else {coop_end as usize};
         ctx.fpregs = [0; 32];
         ctx.pc = entry as usize;
     }
@@ -149,36 +170,41 @@ extern "C" fn sigalrm_handler(_signum: i32, _info: *mut libc::siginfo_t, context
         let ss= &mut (*(*uc).uc_mcontext).__ss as &mut DarwinArmThreadState;
         let neon: &mut DarwinArmNeonState = &mut (*(*uc).uc_mcontext).__ns as &mut DarwinArmNeonState;
 
-        let cur = CURRENT.load(Ordering::Relaxed);
-        if cur.is_null() {
+        let cur = CURRENT.with(|c| c.borrow().clone());
+        if cur.is_some() {
+            let cur = cur.unwrap();
+            let cur_alive = cur.state.load(Ordering::Acquire) != ThreadState::EXITED as usize;
+            if cur_alive {
+                let tcx =&mut *cur.context.get();
+                tcx.sp = (*ss).__sp as usize;
+                tcx.pc = (*ss).__pc as usize;
+                tcx.regs[29] = (*ss).__fp as usize;
+                tcx.regs[30] = (*ss).__lr as usize;
+
+                core::ptr::copy_nonoverlapping(ss.__x.as_ptr(), tcx.regs.as_mut_ptr() as *mut _, 28);
+                // for i in 0..28 {
+                //     tcx.regs[i] = (*ss).__x[i] as usize;
+                // }
+                core::ptr::copy_nonoverlapping(neon.__v.as_ptr(), tcx.fpregs.as_mut_ptr() as *mut _, 32);
+                
+                (*cur).state.store(ThreadState::PREEMPT as usize, Ordering::Release);
+                PREEPMT_INJECTOR.push(cur.clone());
+            }
+        }
+        let next = PREEPMT_WORKER.with(|local| {
+            local.pop().or_else(|| {
+                PREEPMT_INJECTOR.steal().success()
+            })
+        });
+        if next.is_none() {
             return;
         }
-
-        let tcx = &mut (*cur).context;
-        tcx.sp = (*ss).__sp as usize;
-        tcx.pc = (*ss).__pc as usize;
-        tcx.regs[29] = (*ss).__fp as usize;
-        tcx.regs[30] = (*ss).__lr as usize;
-
-        core::ptr::copy_nonoverlapping(ss.__x.as_ptr(), tcx.regs.as_mut_ptr() as *mut _, 28);
-        // for i in 0..28 {
-        //     tcx.regs[i] = (*ss).__x[i] as usize;
-        // }
-        core::ptr::copy_nonoverlapping(neon.__v.as_ptr(), tcx.fpregs.as_mut_ptr() as *mut _, 32);
-        
-        (*cur).state.store(ThreadState::READY as usize, Ordering::Release);
-        let mut next = QUEUE.dequeue();
-
-        if next.is_null() {
-            next = cur;
-        } else {
-            QUEUE.enqueue(cur);
-        }
-
-        //println!("Switching to thread {}", (*next).tid);
-        CURRENT.store(next, Ordering::Release);
+        let next = next.unwrap();
+        CURRENT.with(|c| {
+            *c.borrow_mut() = Some(next.clone());
+        });
         (*next).state.store(ThreadState::RUNNING as usize, Ordering::Release);
-        let ncx = &mut (*next).context;
+        let ncx = &*(*next).context.get();
         (*ss).__sp = ncx.sp as u64;
         (*ss).__pc = ncx.pc as u64;
         (*ss).__fp = ncx.regs[29] as u64;
@@ -220,75 +246,163 @@ fn test(s: usize) {
 
 extern "C" fn hello() {
     test(1);
-    yield_to();
+    //yield_to();
+    //std::thread::sleep(std::time::Duration::from_millis(2000));
     println!("Hello, world!");
 }
 
 extern "C" fn world() {
-    //std::thread::sleep(std::time::Duration::from_millis(2000));
+    std::thread::sleep(std::time::Duration::from_millis(2000));
     println!("World, world!");
+}
+
+pub fn start_thread_pool() {
+    let sched = Arc::new(Mutex::new(Scheduler::new()));
+    sched.lock().unwrap().spawn(hello);
+    sched.lock().unwrap().spawn(world);
+    sched.lock().unwrap().spawn(hello);
+    sched.lock().unwrap().spawn(world);
+    sched.lock().unwrap().spawn(hello);
+    sched.lock().unwrap().spawn(world);
+    sched.lock().unwrap().spawn(hello);
+    sched.lock().unwrap().spawn(world);
+    sched.lock().unwrap().spawn(hello);
+    sched.lock().unwrap().spawn(world);
+    sched.lock().unwrap().spawn(hello);
+    sched.lock().unwrap().spawn(world);
+    sched.lock().unwrap().spawn(hello);
+    sched.lock().unwrap().spawn(world);
+    sched.lock().unwrap().spawn_yield(hello);
+    sched.lock().unwrap().spawn_yield(world);
+    let coop_handle = thread::Builder::new()
+        .name("coop_worker".to_string())
+        .spawn(move || {
+            unsafe {
+                let mut mask: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut mask);
+                libc::sigaddset(&mut mask, libc::SIGALRM);
+                libc::pthread_sigmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut());
+                coop_end();
+            }
+        })
+        .expect("Failed to spawn cooperative worker thread");
+
+    let mut preemptive_handles = Vec::new();
+    for i in 0..4 {
+        let handle = thread::Builder::new()
+            .name(format!("preemptive_worker_{}", i))
+            .spawn({
+                move || {
+                    unsafe {
+                        let mut mask: libc::sigset_t = std::mem::zeroed();
+                        libc::sigemptyset(&mut mask);
+                        libc::sigaddset(&mut mask, libc::SIGALRM);
+                        libc::pthread_sigmask(libc::SIG_UNBLOCK, &mask, std::ptr::null_mut());
+                        setup_preemption();
+                    }
+                }
+            })
+            .expect("Failed to spawn preemptive worker thread");
+        preemptive_handles.push(handle);
+    }
+    for handle in preemptive_handles {
+        handle.join().expect("Failed to join preemptive worker thread");
+    }
+    coop_handle.join().expect("Failed to join cooperative worker thread");
 }
 
 pub fn run() {
     unsafe {
         SCHEDULER = Box::into_raw(Box::new(Scheduler::new()));
         let scheduler = &mut *SCHEDULER;
-        scheduler.spawn(hello);
+        //scheduler.spawn_yield(hello);
+        //scheduler.spawn_yield(world);
         scheduler.spawn(world);
-        for t in scheduler.threads.iter().skip(1) {
-            QUEUE.enqueue(t as *const _ as *mut _);
-        }
-        let first = scheduler.threads.first().unwrap() as *const _ as *mut _;
-        CURRENT.store(first, Ordering::Release);
+        scheduler.spawn(hello);
+        // let first = scheduler.threads.first().unwrap();
+        // CURRENT.with(|c| {
+        //     *c.borrow_mut() = Some(Arc::from_raw(first));
+        // });
         
-       //setup_preemption();
-       (*first).state.store(ThreadState::RUNNING as usize, Ordering::Release);
-        let mut dummy_ctx = ThreadContext::zeroed();
-        switch(&mut dummy_ctx, &(*first).context);
-        core::hint::unreachable_unchecked();
+       setup_preemption();
+       loop{};
+    //    (*first).state.store(ThreadState::RUNNING as usize, Ordering::Release);
+    //     let mut dummy_ctx = ThreadContext::zeroed();
+    //     let ctx = first.context.get();
+    //     switch(&mut dummy_ctx, ctx);
+    //     core::hint::unreachable_unchecked();
+        //coop_end();
     }
 
 }
 
 fn yield_to() {
     unsafe {
-        let cur = CURRENT.load(Ordering::Relaxed);
-        debug_assert!(!cur.is_null(), "yield_now with no CURRENT thread");
-        (*cur).state.store(ThreadState::YIELD as usize, Ordering::Release);
-        QUEUE.enqueue(cur);
-        let next = QUEUE.dequeue();
-        if next.is_null() {
+        let next = COOP_WORKER.with(|local| {
+            local.pop().or_else(|| {
+                COOP_INJECTOR.steal().success()
+            })
+        });
+        let cur = CURRENT.with(|c| c.borrow().clone());
+        debug_assert!(!cur.is_none(), "yield_now with no CURRENT thread");
+        let cur = cur.unwrap();
+        if cur.preempt_active {
+            panic!("Cannot yield from a preemptive thread");
+        }
+        cur.state.store(ThreadState::YIELD as usize, Ordering::Release);
+        COOP_INJECTOR.push(cur.clone());
+        if next.is_none() {
             println!("No more threads to run, exiting.");
             thread_exit();
         }
-        println!("Switching to thread {}", (*next).tid);
+        let next = next.unwrap();
+        println!("Switching to thread {} cooperatively", (*next).tid);
         (*next).state.store(ThreadState::RUNNING as usize, Ordering::Release);
-        CURRENT.store(next, Ordering::Release);
-        let ctx = &mut (*cur).context;
-        switch(ctx, &(*next).context);
+        CURRENT.with(|c| {
+            *c.borrow_mut() = Some(next.clone());
+        });
+        let ctx = cur.context.get();
+        let next_ctx = (*next).context.get();
+        switch(ctx, next_ctx);
     }
 }
 
-pub unsafe extern "C" fn event_loop_entry() {
+pub unsafe extern "C" fn preempt_end() {
+    let cur = CURRENT.with(|c| c.borrow().clone());
+    if let Some(cur) = cur {
+        if cur.state.load(Ordering::Acquire) == ThreadState::RUNNING as usize {
+            cur.state.store(ThreadState::EXITED as usize, Ordering::Release);
+        }
+    }
+    loop {}
+    
+}
+
+pub unsafe extern "C" fn coop_end() {
+    let cur = CURRENT.with(|c| c.borrow().clone());
+    if let Some(cur) = cur .as_ref(){
+        if cur.state.load(Ordering::Acquire) == ThreadState::RUNNING as usize {
+            cur.state.store(ThreadState::EXITED as usize, Ordering::Release);
+        }
+    }
     loop {
-        let cur = CURRENT.load(Ordering::Relaxed);
-        let ctx = &mut (*cur).context;
-        if let Some(cur) = CURRENT.load(Ordering::Relaxed).as_mut() {
-            if cur.state.load(Ordering::Acquire) == ThreadState::READY as usize || cur.state.load(Ordering::Acquire) == ThreadState::YIELD as usize {
-                QUEUE.enqueue(cur);
-            } else if cur.state.load(Ordering::Acquire) == ThreadState::RUNNING as usize {
-                cur.state.store(ThreadState::EXITED as usize, Ordering::Release);
-            }
+        let next = COOP_WORKER.with(|local| {
+            local.pop().or_else(|| {
+                COOP_INJECTOR.steal().success()
+            })
+        });
+        if next.is_none() {
+            continue;
         }
-        let next = QUEUE.dequeue();
-        if next.is_null() {
-            println!("No more threads to run, exiting.");
-            thread_exit();
-        }
-        println!("Switching to thread {}", (*next).tid);
+        let next = next.unwrap();
+        println!("Switching to thread {} after exited", (*next).tid);
         (*next).state.store(ThreadState::RUNNING as usize, Ordering::Release);
-        CURRENT.store(next, Ordering::Release);
-        switch(ctx, &(*next).context);
+        CURRENT.with(|c| {
+            *c.borrow_mut() = Some(next.clone());
+        });
+        let dummy_ctx = &mut ThreadContext::zeroed();
+        let next_ctx = (*next).context.get();
+        switch(dummy_ctx, next_ctx);
     }
 }
 
