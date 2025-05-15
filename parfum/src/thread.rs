@@ -96,6 +96,31 @@ impl Scheduler {
         self.threads.lock().unwrap().push(thread.clone());
         COOP_INJECTOR.push(thread);
     }
+
+    pub fn spawn_fn<F>(&mut self, f: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let wrapper = Box::new(ClosureWrapper { closure: Some(Box::new(f)) });
+        let wrapper_ptr = Box::into_raw(wrapper) as *mut ();
+        println!("[spawn_fn] wrapper_ptr: {:p}", wrapper_ptr);
+        let mut ctx = ThreadContext::zeroed();
+        let (top, bottom) = unsafe { reserve_stack() };
+        init_stack_with_arg(top, &mut ctx, rust_trampoline, wrapper_ptr);
+        let tid = self.threads.lock().unwrap().len();
+        let thread = Arc::new(GreenThread {
+            context: UnsafeCell::new(ctx),
+            stack_top: top,
+            stack_bottom: AtomicUsize::new(bottom),
+            tid,
+            state: AtomicUsize::new(ThreadState::READY as usize),
+            ticks: AtomicI32::new(100),
+            next: AtomicPtr::new(std::ptr::null_mut()),
+        });
+        println!("Spawning thread {} (closure)", tid);
+        self.threads.lock().unwrap().push(thread.clone());
+        COOP_INJECTOR.push(thread);
+    }
 }
 
 pub fn init_stack(stack_top: usize, ctx: &mut ThreadContext, entry: unsafe extern "C" fn()) {
@@ -104,6 +129,21 @@ pub fn init_stack(stack_top: usize, ctx: &mut ThreadContext, entry: unsafe exter
 
     ctx.sp = sp;
     ctx.regs = [0; 32];
+    ctx.regs[30] = end_yield as usize;
+    ctx.fpregs = [0; 32];
+    ctx.pc = entry as usize;
+}
+
+pub fn init_stack_with_arg(
+    stack_top: usize,
+    ctx: &mut ThreadContext,
+    entry: unsafe extern "C" fn(*mut ()),
+    arg: *mut (),
+) {
+    let sp = stack_top & !0x0F;
+    ctx.sp = sp;
+    ctx.regs = [0; 32];
+    ctx.regs[0] = arg as usize;
     ctx.regs[30] = end_yield as usize;
     ctx.fpregs = [0; 32];
     ctx.pc = entry as usize;
@@ -134,7 +174,7 @@ extern "C" fn sigalrm_handler(_signum: i32, _info: *mut libc::siginfo_t, _contex
     // async_signal_safe_print("[SIGNAL] SIGALRM received - preemption requested\n");
 }
 
-fn setup_preemption() {
+pub fn setup_preemption() {
     unsafe {
         let mut sa: libc::sigaction = libc::sigaction {
             sa_sigaction: sigalrm_handler as usize,
@@ -152,14 +192,10 @@ fn setup_preemption() {
     setup_timer();
 }
 
-// Function to check if preemption has been requested and handle it if needed
-fn check_preemption() -> bool {
-    // Check if preemption has been requested using atomic ordering
+pub fn check_preemption() -> bool {
     if PREEMPTION_REQUESTED.load(Ordering::Acquire) {
-        // Reset the flag for next time
         PREEMPTION_REQUESTED.store(false, Ordering::Release);
         println!("Preemption requested, yielding thread");
-        // Perform preemption by calling yield_to at a safe sync point
         yield_to();
         return true;
     }
@@ -185,14 +221,12 @@ extern "C" fn hello() {
     test(1);
     check_preemption();
     println!("Hello, world!");
-    // Check for preemption at the end of function
     check_preemption();
 }
 
 extern "C" fn world() {
     check_preemption();
     println!("World, world!");
-    // Check for preemption at the end of function
     check_preemption();
 }
 
@@ -219,7 +253,7 @@ extern "C" fn test_spawn() {
     unsafe { end_yield(); }
 }
 
-fn yield_to() {
+pub fn yield_to() {
     unsafe {
         let cur = CURRENT.with(|c| c.borrow().clone());
         debug_assert!(cur.is_some(), "yield_now with no CURRENT thread");
@@ -307,17 +341,37 @@ pub extern "C" fn thread_exit() -> ! {
     std::process::exit(0);
 }
 
-global_asm!(include_str!("arch/arm64/switch.S"));
+struct ClosureWrapper {
+    closure: Option<Box<dyn FnOnce()>>,
+}
 
-#[no_mangle]
-extern "C" fn trampoline() {
-    unsafe {
-        let sp: usize;
-        asm!("mov {}, sp", out(reg) sp);
-        let func_ptr = *(sp as *const extern "C" fn());
-        func_ptr();
+impl ClosureWrapper {
+    fn call(mut self: Box<Self>) {
+        if let Some(closure) = self.closure.take() {
+            closure();
+        }
     }
 }
+
+extern "C" fn rust_trampoline(f: *mut ()) {
+    println!("[trampoline] received pointer: {:p}", f);
+    unsafe {
+        let wrapper: Box<ClosureWrapper> = Box::from_raw(f as *mut ClosureWrapper);
+        println!("[trampoline] Box::from_raw OK");
+        wrapper.call();
+        println!("[trampoline] closure called");
+        end_yield();
+    }
+}
+
+pub fn spawn_fn<F>(f: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    SCHEDULER.lock().unwrap().spawn_fn(f);
+}
+
+global_asm!(include_str!("arch/arm64/switch.S"));
 
 extern "C" {
     pub fn switch(current: *mut ThreadContext, next: *const ThreadContext);

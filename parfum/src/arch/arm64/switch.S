@@ -61,6 +61,9 @@ _switch:
     ldp q28, q29, [x1, #0x2d0]
     ldp q30, q31, [x1, #0x2f0]
 
+    // Restore x0 (argument register) from context
+    ldr x0, [x1, #0x10]
+
     //ldr lr, [x1, #0x310]
 
     ldr x16, [x1, #0x310]
