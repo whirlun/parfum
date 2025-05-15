@@ -78,25 +78,6 @@ impl Scheduler {
         }
     }
 
-    pub fn spawn(&mut self, entry: unsafe extern "C" fn()) {
-        let mut ctx = ThreadContext::zeroed();
-        let (top, bottom) = unsafe { reserve_stack() };
-        init_stack(top, &mut ctx, entry);
-        let tid = self.threads.lock().unwrap().len();
-        let thread = Arc::new(GreenThread {
-            context: UnsafeCell::new(ctx),
-            stack_top: top,
-            stack_bottom: AtomicUsize::new(bottom),
-            tid,
-            state: AtomicUsize::new(ThreadState::READY as usize),
-            ticks: AtomicI32::new(100),
-            next: AtomicPtr::new(std::ptr::null_mut()),
-        });
-        println!("Spawning thread {}", tid);
-        self.threads.lock().unwrap().push(thread.clone());
-        COOP_INJECTOR.push(thread);
-    }
-
     pub fn spawn_fn<F>(&mut self, f: F)
     where
         F: FnOnce() + Send + 'static,
@@ -202,56 +183,6 @@ pub fn check_preemption() -> bool {
     return false;
 }
 
-fn test2(s: usize) {
-    loop {
-        check_preemption();
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        println!("Test2 function called with value: {}", s);
-    }
-}
-
-fn test(s: usize) {
-    check_preemption();
-    test2(2);
-    println!("Test function called with value: {}", s);
-}
-
-extern "C" fn hello() {
-    check_preemption();
-    test(1);
-    check_preemption();
-    println!("Hello, world!");
-    check_preemption();
-}
-
-extern "C" fn world() {
-    check_preemption();
-    println!("World, world!");
-    check_preemption();
-}
-
-pub fn start_thread_pool() {
-    setup_preemption();
-
-    SCHEDULER.lock().unwrap().spawn(hello);
-    SCHEDULER.lock().unwrap().spawn(world);
-    SCHEDULER.lock().unwrap().spawn(test_spawn);
-
-    unsafe {end_yield();}
-
-}
-
-extern "C" fn test_spawn() {
-    println!("Test spawn function called");
-    check_preemption();
-    std::thread::sleep(std::time::Duration::from_millis(5000));
-    check_preemption();
-    SCHEDULER.lock().unwrap().spawn(hello);
-    check_preemption();
-    SCHEDULER.lock().unwrap().spawn(world);
-
-    unsafe { end_yield(); }
-}
 
 pub fn yield_to() {
     unsafe {
