@@ -308,7 +308,7 @@ extern "C" {
     pub fn switch(current: *mut ThreadContext, next: *const ThreadContext);
 }
 
-fn async_signal_safe_print(msg: &str) {
+pub fn async_signal_safe_print(msg: &str) {
     unsafe {
         let bytes = msg.as_bytes();
         libc::write(libc::STDOUT_FILENO, bytes.as_ptr() as *const libc::c_void, bytes.len());

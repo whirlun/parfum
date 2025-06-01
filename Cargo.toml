@@ -1,3 +1,3 @@
 [workspace]
 resolver = "2"
-members = ["parfum-example","parfum"]
+members = ["parfum-example","parfum", "parfum-macro"]

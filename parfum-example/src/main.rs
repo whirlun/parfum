@@ -1,7 +1,9 @@
 use parfum::thread;
+use parfum::stack::install_segv_handler;
 use std::time::Duration;
 
 fn main() {
+    install_segv_handler();
     parfum::thread::setup_preemption();
     // Spawn a closure using the new spawn_fn API!
     // parfum::thread::spawn_fn(|| {
@@ -13,22 +15,21 @@ fn main() {
     // });
 
     // Test explicit yield and preemption
-    for tid in 0..3 {
-        parfum::thread::spawn_fn(move || {
-            let mut i = 0;
-            loop {
-                // Preemption check at the top
-                parfum::thread::check_preemption();
-                println!("[green thread {}] iteration {}", tid, i);
-                i += 1;
-                if i % 3 == 0 {
-                    println!("[green thread {}] yielding", tid);
-                    parfum::thread::yield_to();
-                }
-                std::thread::sleep(Duration::from_millis(200));
-            }
-        });
+    
+
+    // Test stack growth with a deep recursive function
+    fn deep_rec(n: usize) -> usize {
+        println!("[deep_rec] n = {}", n);
+        if n == 0 { 1 } else { 1 + deep_rec(n - 1) }
     }
+    // let depth = 2000; // Should be enough to trigger stack growth
+    // let result = deep_rec(depth);
+    // println!("[main] deep_rec({}) = {}", depth, result);
+    // assert_eq!(result, depth + 1);
+
+    parfum::thread::spawn_fn(|| {
+        deep_rec(1000);
+    });
 
     unsafe {
         thread::end_yield();
