@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 parfum = {path = "../parfum"}
+parfum-macro = {path = "../parfum-macro"}
